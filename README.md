@@ -2,7 +2,9 @@
 A lightweight Wake-on-LAN (WOL) utility that supports Win95 to Win11, written in pure C using the native Win32 API.
 * Allows you to manage a list of computers, check their online status via ICMP or TCP, and wake them up using Magic Packets.
 
-<img width="420" height="520" alt="wol1" src="https://github.com/user-attachments/assets/3f5c3a20-b93f-4f3c-a8d4-c6b025ef43a3" /> 
+<img src="https://github.com/user-attachments/assets/3f5c3a20-b93f-4f3c-a8d4-c6b025ef43a3" width="30%"></img>
+<img src="https://github.com/user-attachments/assets/677c5b2f-ab75-4999-ae5a-7159d9d46f98" width="30%"></img> 
+<img src="https://github.com/user-attachments/assets/fd4703bc-d0e6-45a7-a9ea-879d746ca606" width="30%"></img>
 
 ## Features
 * **Native & Fast:** <em>Built with pure Win32 API and Winsock. No heavy frameworks, no .NET requirements, and a microscopic binary size.</em>
