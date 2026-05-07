@@ -1,5 +1,5 @@
 # WOL Sender
-A lightweight Wake-on-LAN (WOL) utility that supports Win95 to Win11, written in pure C using the native Win32 API.
+A lightweight 100KB Wake-on-LAN (WOL) utility that supports Win95 to Win11, written in pure C using the native Win32 API.
 * Allows you to manage a list of computers, check their online status via ICMP or TCP, and wake them up using Magic Packets.
 
 <img src="https://github.com/user-attachments/assets/3f5c3a20-b93f-4f3c-a8d4-c6b025ef43a3" width="30%"></img>
@@ -17,7 +17,7 @@ A lightweight Wake-on-LAN (WOL) utility that supports Win95 to Win11, written in
       
 *  **Import/Export:** <em>Easily move your contact list between machines using the built-in INI import/export functions.</em>
       
-*  **Tiny Footprint:** <em>Highly optimized for size, targeting compatibility back to older i386 architectures.</em>
+*  **Tiny Footprint:** <em>Highly optimized for size, targeting compatibility back to older i386 architectures. 100KB size.</em>
 
 ## Compile & Build
 
