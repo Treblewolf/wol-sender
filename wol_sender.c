@@ -9,16 +9,27 @@
  * compatibility shims (OPENFILENAME size, common-controls init, ICMP).
  *
  *   gcc wolsender.c resources.o -o wolsender.exe \
- *       -mwindows -Os -s -march=i386 -mno-sse -mno-sse2 \
- *       -ffunction-sections -fdata-sections -Wl,--gc-sections \
+ *       -mwindows -Os -s -march=i386 -mtune=i386 -mno-sse -mno-sse2 \
+ *       -ffunction-sections -fdata-sections \
+ *       -Wl,--gc-sections -Wl,--disable-runtime-pseudo-reloc \
  *       -lwsock32 -lcomdlg32 -lcomctl32 -lshell32
  *   upx --best --lzma wolsender.exe
+ *
+ * Notes:
+ *   GCC itself honors -march=i386 and emits no CMOV in our code, but
+ *   the MinGW libmingwex CRT (e.g. __mingw_sformat used by sscanf and
+ *   its strtod/__strtodg dependencies) is shipped pre-compiled for
+ *   i686 and DOES contain CMOVcc. CMOVcc is a P6+ instruction; on a
+ *   real Pentium (P5 - e.g. Toshiba Libretto 50CT) this triggers an
+ *   invalid-instruction fault at startup. We avoid this by not using
+ *   sscanf (custom MAC parser in ParseMacAddress) so --gc-sections
+ *   drops the whole format-parser chain, and by disabling MinGW's PE
+ *   pseudo-relocation runtime which has its own CMOVcc helpers.
  */
 
 #include <windows.h>
 #include <windowsx.h>
 #include <winsock.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <commctrl.h>
@@ -151,6 +162,28 @@ typedef struct {
 } ICMP_ECHO_REPLY_HDR;
 
 /* ====================================================================
+ *  CRT overrides
+ *
+ *  MinGW ships libmingw32 pre-compiled for i686 (CMOVcc) and libmingwex
+ *  helpers compiled with SSE2 (MOVSD/UNPCKLPD). Those instructions
+ *  raise #UD and the process dies before WinMain.
+ *
+ *  Providing an empty _pei386_runtime_relocator overrides MinGW's
+ *  version: with --disable-runtime-pseudo-reloc the table is empty
+ *  anyway, so the loop body never runs, but supplying an empty stub
+ *  also lets --gc-sections discard the called helpers
+ *  (_mark_section_writable, __GetPEImageBase) which themselves use
+ *  CMOVcc.
+ *
+ *  Combined with the custom main() below (which replaces the default
+ *  CMOV-using libmingw32 main wrapper) and the hand-rolled MAC parser
+ *  (which lets --gc-sections discard the entire __mingw_sformat /
+ *  __strtodg chain), the active code path is free of P6+ instructions.
+ * ==================================================================== */
+
+void _pei386_runtime_relocator(void) {}
+
+/* ====================================================================
  *  Static state (single main window; assigned during WM_CREATE)
  * ==================================================================== */
 
@@ -192,7 +225,8 @@ static const char ABOUT_MSG[] =
     "v1.0.2 - Bounded string builders, atomic busy flag, \n"
     "         MAC byte validation, C99 flex arrays,\n"
     "         strict-aliasing-safe ICMP read,\n"
-    "         hostname syntax check, 17-char MAC input limit\n\n"
+    "         hostname syntax check, 17-char MAC input limit,\n"
+    "         no CMOV/SSE in active code (real Pentium safe)\n\n"
     "v1.0.1 - Status column, async checks, auto-refresh,\n"
     "         sortable headers, saved window/column sizes\n\n"
     "v1.0   - Initial release\n\n\n"
@@ -432,35 +466,49 @@ static BOOL CheckEvaluateOne(const char* computerName,
     return FALSE;
 }
 
+static BOOL ParseMacAddress(const char* s, unsigned char out[6]) {
+    int i;
+    char sep = 0;
+
+    if (s == NULL) return FALSE;
+    for (i = 0; i < 6; i++) {
+        unsigned int v = 0;
+        int          hexlen = 0;
+        while (hexlen < 2) {
+            char c = *s;
+            int  d;
+            if      (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else break;
+            v = (v << 4) | (unsigned)d;
+            hexlen++;
+            s++;
+        }
+        if (hexlen == 0) return FALSE;
+        out[i] = (unsigned char)v;
+        if (i < 5) {
+            char c = *s;
+            if (c != ':' && c != '-') return FALSE;
+            if (sep == 0) sep = c;
+            else if (sep != c) return FALSE;   /* don't mix ':' and '-' */
+            s++;
+        }
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    return (*s == '\0');
+}
+
 static BOOL WakeEvaluateOne(const char* macStr, char* detail, int detailLen) {
-    unsigned int values[6];
-    BOOL         parsed = FALSE;
-    int          i;
+    unsigned char mac[6];
 
-    if (sscanf(macStr, "%x:%x:%x:%x:%x:%x",
-               &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) parsed = TRUE;
-    else if (sscanf(macStr, "%x-%x-%x-%x-%x-%x",
-                    &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) parsed = TRUE;
-
-    if (!parsed) {
+    if (!ParseMacAddress(macStr, mac)) {
         lstrcpyn(detail, "Error: Invalid MAC format.", detailLen);
         return FALSE;
     }
-    /* %x accepts any unsigned-int-wide hex, including 0xFFFFFFFF.
-     * Reject anything that wouldn't round-trip through a MAC byte. */
-    for (i = 0; i < 6; i++) {
-        if (values[i] > 0xFFu) {
-            lstrcpyn(detail, "Error: MAC byte out of range.", detailLen);
-            return FALSE;
-        }
-    }
-    {
-        unsigned char mac[6];
-        for (i = 0; i < 6; i++) mac[i] = (unsigned char)values[i];
-        if (SendWakeOnLan(mac)) {
-            lstrcpyn(detail, "WOL Magic Packet Sent!", detailLen);
-            return TRUE;
-        }
+    if (SendWakeOnLan(mac)) {
+        lstrcpyn(detail, "WOL Magic Packet Sent!", detailLen);
+        return TRUE;
     }
     lstrcpyn(detail, "Error: Network failure.", detailLen);
     return FALSE;
@@ -1516,7 +1564,34 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
 /* ====================================================================
  *  WinMain
+ *
+ *  MinGW's CRT entry point (WinMainCRTStartup -> __mingw_invoke_user_main)
+ *  ultimately calls a C main(), and libmingw32 provides a default main()
+ *  wrapper that parses the command line and unpacks nCmdShow before
+ *  calling WinMain. That default wrapper is compiled for i686 and uses
+ *  CMOVcc - which faults on a real Pentium (no P6 = no CMOV). We supply
+ *  our own minimal main() so the i686 wrapper is never linked in.
+ *
+ *  We don't use argc/argv or lpCmdLine anywhere, so the wrapper has
+ *  nothing to do for us beyond getting the show-window flag from
+ *  STARTUPINFO, which we do here without conditional-move instructions.
  * ==================================================================== */
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow);
+
+static int GetStartupShowCmd(void) {
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    GetStartupInfoA(&si);
+    if (si.dwFlags & STARTF_USESHOWWINDOW) return si.wShowWindow;
+    return SW_SHOWDEFAULT;
+}
+
+int main(void) {
+    HINSTANCE hInst = GetModuleHandleA(NULL);
+    return WinMain(hInst, NULL, GetCommandLineA(), GetStartupShowCmd());
+}
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     WNDCLASS wc = {0};
