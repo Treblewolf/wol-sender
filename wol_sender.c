@@ -1,5 +1,5 @@
 /*
- * WOL Sender 1.0.1 - Wake-on-LAN client with reachability check.
+ * WOL Sender 1.0.2 - Wake-on-LAN client with reachability check.
  *
  * MIT License
  *
@@ -8,11 +8,11 @@
  * Built with mingw32 gcc; targets Windows 9x and later via runtime
  * compatibility shims (OPENFILENAME size, common-controls init, ICMP).
  *
- *   gcc wolsender.v1.0.1.c resources.o -o wolsender.v1.0.1.exe \
+ *   gcc wolsender.c resources.o -o wolsender.exe \
  *       -mwindows -Os -s -march=i386 -mno-sse -mno-sse2 \
  *       -ffunction-sections -fdata-sections -Wl,--gc-sections \
  *       -lwsock32 -lcomdlg32 -lcomctl32 -lshell32
- *   upx --best --lzma wolsender.v1.0.1.exe
+ *   upx --best --lzma wolsender.exe
  */
 
 #include <windows.h>
@@ -126,7 +126,7 @@ typedef struct {
     HWND         hwnd;
     BOOL         manual;
     int          count;
-    CheckJobItem items[1];
+    CheckJobItem items[]; /* C99 flexible array member */
 } CheckJob;
 
 typedef struct {
@@ -138,7 +138,7 @@ typedef struct {
 typedef struct {
     BOOL            manual;
     int             count;
-    CheckResultItem items[1];
+    CheckResultItem items[]; /* C99 flexible array member */
 } CheckResult;
 
 typedef HANDLE (WINAPI *PFN_IcmpCreateFile)(void);
@@ -187,8 +187,12 @@ static const char CLASS_NAME[]  = "WOLAppClass";
 static const char APP_TITLE[]   = "WOL Sender";
 
 static const char ABOUT_MSG[] =
-    "WOL Sender v.1.0.1 by Treblewolf\n\n"
+    "WOL Sender v.1.0.2 by Treblewolf\n\n"
     "Changelog:\n\n"
+    "v1.0.2 - Bounded string builders, atomic busy flag, \n"
+    "         MAC byte validation, C99 flex arrays,\n"
+    "         strict-aliasing-safe ICMP read,\n"
+    "         hostname syntax check, 17-char MAC input limit\n\n"
     "v1.0.1 - Status column, async checks, auto-refresh,\n"
     "         sortable headers, saved window/column sizes\n\n"
     "v1.0   - Initial release\n\n\n"
@@ -268,6 +272,48 @@ static BOOL ResolveHostToAddr(const char* name, struct in_addr* out) {
     }
 }
 
+/* Reject inputs that obviously aren't an IPv4 literal or a real
+ * hostname before we hand them to gethostbyname(). */
+static BOOL IsLikelyHostname(const char* name) {
+    int len, i, labelLen, hasAlpha, hasDot;
+
+    if (name == NULL) return FALSE;
+    len = lstrlen(name);
+    if (len < 1 || len > 253) return FALSE;
+
+    if (inet_addr(name) != INADDR_NONE) return TRUE;
+
+    hasAlpha = 0;
+    hasDot   = 0;
+    labelLen = 0;
+    for (i = 0; i < len; i++) {
+        char c = name[i];
+        if (c == '.') {
+            if (labelLen == 0)        return FALSE;
+            if (labelLen > 63)        return FALSE;
+            if (name[i - 1] == '-')   return FALSE;
+            hasDot = 1;
+            labelLen = 0;
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            hasAlpha = 1;
+            labelLen++;
+        } else if (c >= '0' && c <= '9') {
+            labelLen++;
+        } else if (c == '-') {
+            if (labelLen == 0) return FALSE;
+            labelLen++;
+        } else {
+            return FALSE;
+        }
+    }
+    if (labelLen == 0 || labelLen > 63) return FALSE;
+    if (name[len - 1] == '-')           return FALSE;
+
+    /* Pure-numeric names with no dots aren't IP literals */
+    if (!hasAlpha && !hasDot) return FALSE;
+    return TRUE;
+}
+
 static BOOL TryLoadIcmp(PFN_IcmpCreateFile* pC, PFN_IcmpCloseHandle* pCl,
                         PFN_IcmpSendEcho* pS, HMODULE* pMod) {
     HMODULE h = LoadLibraryA("icmp.dll");
@@ -287,11 +333,11 @@ static BOOL TryLoadIcmp(PFN_IcmpCreateFile* pC, PFN_IcmpCloseHandle* pCl,
 
 static BOOL TryIcmpPing(PFN_IcmpCreateFile pfnC, PFN_IcmpCloseHandle pfnCl,
                         PFN_IcmpSendEcho pfnS, struct in_addr addr) {
-    HANDLE h;
-    char   sendData[4];
-    char   replyBuf[256];
-    DWORD  n;
-    ICMP_ECHO_REPLY_HDR* r;
+    HANDLE              h;
+    char                sendData[4];
+    char                replyBuf[256];
+    DWORD               n;
+    ICMP_ECHO_REPLY_HDR hdr;
 
     h = pfnC();
     if (h == INVALID_HANDLE_VALUE) return FALSE;
@@ -299,8 +345,11 @@ static BOOL TryIcmpPing(PFN_IcmpCreateFile pfnC, PFN_IcmpCloseHandle pfnCl,
              NULL, replyBuf, sizeof(replyBuf), 2000);
     pfnCl(h);
     if (n == 0) return FALSE;
-    r = (ICMP_ECHO_REPLY_HDR*)replyBuf;
-    return (r->Status == 0);
+    /* Copy out the prefix rather than reinterpreting a char[] as a
+     * struct pointer; the latter is a strict-aliasing violation that
+     * GCC can and does miscompile at higher optimization levels. */
+    memcpy(&hdr, replyBuf, sizeof(hdr));
+    return (hdr.Status == 0);
 }
 
 static BOOL TcpPortReachable(struct in_addr addr, unsigned short port) {
@@ -363,6 +412,10 @@ static BOOL CheckEvaluateOne(const char* computerName,
         lstrcpyn(detail, "No computer name", detailLen);
         return FALSE;
     }
+    if (!IsLikelyHostname(computerName)) {
+        lstrcpyn(detail, "Invalid name (Off)", detailLen);
+        return FALSE;
+    }
     if (!ResolveHostToAddr(computerName, &addr)) {
         lstrcpyn(detail, "Unknown host", detailLen);
         return FALSE;
@@ -380,9 +433,9 @@ static BOOL CheckEvaluateOne(const char* computerName,
 }
 
 static BOOL WakeEvaluateOne(const char* macStr, char* detail, int detailLen) {
-    int  values[6];
-    BOOL parsed = FALSE;
-    int  i;
+    unsigned int values[6];
+    BOOL         parsed = FALSE;
+    int          i;
 
     if (sscanf(macStr, "%x:%x:%x:%x:%x:%x",
                &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) parsed = TRUE;
@@ -392,6 +445,14 @@ static BOOL WakeEvaluateOne(const char* macStr, char* detail, int detailLen) {
     if (!parsed) {
         lstrcpyn(detail, "Error: Invalid MAC format.", detailLen);
         return FALSE;
+    }
+    /* %x accepts any unsigned-int-wide hex, including 0xFFFFFFFF.
+     * Reject anything that wouldn't round-trip through a MAC byte. */
+    for (i = 0; i < 6; i++) {
+        if (values[i] > 0xFFu) {
+            lstrcpyn(detail, "Error: MAC byte out of range.", detailLen);
+            return FALSE;
+        }
     }
     {
         unsigned char mac[6];
@@ -451,7 +512,8 @@ static int CALLBACK LVCompareProc(LPARAM lp1, LPARAM lp2, LPARAM lpSort) {
         default:          s1 = g_sortSnap[idx1].col0; s2 = g_sortSnap[idx2].col0; break;
     }
     cmp = stricmp(s1, s2);
-    if (cmp == 0) cmp = (int)idx1 - (int)idx2;
+    /* Stable tie-break without signed-subtraction overflow risk. */
+    if (cmp == 0) cmp = (idx1 > idx2) - (idx1 < idx2);
     return g_sortAscending ? cmp : -cmp;
 }
 
@@ -541,6 +603,25 @@ static void SetStatusParts(const StatusPartCell* cells, int n, UINT resetMs) {
     else             KillTimer(g_hMain, IDT_STATUS_TIMER);
 }
 
+/* Bounded "<label>: <value>" builder. Never writes past outSize-1 and
+ * always NUL-terminates as long as outSize > 0. Replaces the
+ * lstrcpyn/lstrcat/lstrlen-guard idiom which silently truncated only
+ * the tail and miscounted with multi-byte ACP characters. */
+static void BuildLabelLine(char* out, int outSize,
+                           const char* label, const char* value) {
+    int used;
+    if (out == NULL || outSize <= 0) return;
+    lstrcpyn(out, label, outSize);
+    used = lstrlen(out);
+    if (used + 2 < outSize) {
+        lstrcpy(out + used, ": ");
+        used += 2;
+    }
+    if (used < outSize - 1) {
+        lstrcpyn(out + used, value, outSize - used);
+    }
+}
+
 /* ====================================================================
  *  Async check (worker thread + main-thread result handler)
  * ==================================================================== */
@@ -556,9 +637,9 @@ static DWORD WINAPI CheckThreadProc(LPVOID lpParam) {
     WSADATA             wsaData;
     int                 i;
 
-    result = (CheckResult*)malloc(sizeof(CheckResult) + (job->count - 1) * sizeof(CheckResultItem));
+    result = (CheckResult*)malloc(sizeof(CheckResult) + (size_t)job->count * sizeof(CheckResultItem));
     if (result == NULL) {
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
         free(job);
         return 0;
     }
@@ -587,7 +668,7 @@ static DWORD WINAPI CheckThreadProc(LPVOID lpParam) {
     if (hIcmp) FreeLibrary(hIcmp);
     if (!PostMessage(job->hwnd, WM_CHECK_COMPLETE, 0, (LPARAM)result)) {
         free(result);
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
     }
     free(job);
     return 0;
@@ -601,30 +682,32 @@ static void StartCheck(BOOL manual, BOOL allIfNoSelection) {
     DWORD  threadId;
     HANDLE hThread;
 
-    if (g_checkInProgress) {
+    /* Atomically claim the busy flag; if another check is already in
+     * flight, InterlockedExchange returns 1 and we bail without touching
+     * the in-progress run. InterlockedExchange is available on Win95+. */
+    if (InterlockedExchange(&g_checkInProgress, 1) == 1) {
         if (manual)
             SetStatus("Checking already in progress...", COLOR_INFO, STATUS_CLEAR_MS_SINGLE);
         return;
     }
-    g_checkInProgress = 1;
 
     for (i = -1; (i = ListView_GetNextItem(g_hListView, i, LVNI_SELECTED)) != -1; )
         selected++;
 
     if (!allIfNoSelection && selected == 0) {
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
         return;
     }
     if (selected > 0) count = selected;
     if (count <= 0) {
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
         if (manual) SetStatus("No contacts to check.", COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
         return;
     }
 
-    job = (CheckJob*)malloc(sizeof(CheckJob) + (count - 1) * sizeof(CheckJobItem));
+    job = (CheckJob*)malloc(sizeof(CheckJob) + (size_t)count * sizeof(CheckJobItem));
     if (job == NULL) {
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
         if (manual) SetStatus("Check failed: out of memory.", COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
         return;
     }
@@ -649,7 +732,7 @@ static void StartCheck(BOOL manual, BOOL allIfNoSelection) {
     hThread = CreateThread(NULL, 0, CheckThreadProc, job, 0, &threadId);
     if (hThread == NULL) {
         free(job);
-        g_checkInProgress = 0;
+        InterlockedExchange(&g_checkInProgress, 0);
         if (manual) SetStatus("Check failed: could not start worker.",
                               COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
         return;
@@ -670,10 +753,8 @@ static void ApplyCheckResult(CheckResult* result) {
         }
 
         if (result->manual && result->count == 1) {
-            lstrcpyn(line, result->items[i].name, sizeof(line));
-            lstrcat(line, ": ");
-            if (lstrlen(line) + lstrlen(result->items[i].detail) < (int)sizeof(line))
-                lstrcat(line, result->items[i].detail);
+            BuildLabelLine(line, sizeof(line),
+                           result->items[i].name, result->items[i].detail);
             SetStatus(line,
                       result->items[i].ok ? COLOR_OK : COLOR_BAD,
                       STATUS_CLEAR_MS_SINGLE);
@@ -685,7 +766,7 @@ static void ApplyCheckResult(CheckResult* result) {
     if (result->manual && result->count > 1) {
         SetStatus("", COLOR_NEUTRAL, 0);
     }
-    g_checkInProgress = 0;
+    InterlockedExchange(&g_checkInProgress, 0);
 }
 
 /* ====================================================================
@@ -697,9 +778,7 @@ static void WakeOneComputer(int itemIndex, const char* computerName, const char*
     char line[384];
     BOOL ok = WakeEvaluateOne(macStr, detail, sizeof(detail));
 
-    lstrcpyn(line, computerName, sizeof(line));
-    lstrcat(line, ": ");
-    if (lstrlen(line) + lstrlen(detail) < (int)sizeof(line)) lstrcat(line, detail);
+    BuildLabelLine(line, sizeof(line), computerName, detail);
 
     SetRowResultColor(itemIndex, ok);
     SetStatus(line, ok ? COLOR_OK : COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
@@ -724,9 +803,7 @@ static void WakeListSelection(void) {
         ok = WakeEvaluateOne(mac, detail, sizeof(detail));
         SetRowResultColor(iPos, ok);
 
-        lstrcpyn(line, name, sizeof(line));
-        lstrcat(line, ": ");
-        if (lstrlen(line) + lstrlen(detail) < (int)sizeof(line)) lstrcat(line, detail);
+        BuildLabelLine(line, sizeof(line), name, detail);
 
         if (nSel == 1) {
             SetStatus(line, ok ? COLOR_OK : COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
@@ -751,10 +828,31 @@ static void WakeListSelection(void) {
  * ==================================================================== */
 
 static void SetupIniPath(void) {
+    DWORD n;
     char* lastSlash;
-    GetModuleFileName(NULL, g_iniPath, MAX_PATH);
+    int   remaining;
+
+    g_iniPath[0] = '\0';
+    n = GetModuleFileName(NULL, g_iniPath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        /* Fall back to a bare filename in the current directory rather
+         * than reading the uninitialized / unterminated path that a
+         * failed or truncated GetModuleFileName would leave behind. */
+        lstrcpyn(g_iniPath, INI_FILE_NAME, MAX_PATH);
+        return;
+    }
     lastSlash = strrchr(g_iniPath, '\\');
-    if (lastSlash != NULL) strcpy(lastSlash + 1, INI_FILE_NAME);
+    if (lastSlash == NULL) {
+        lstrcpyn(g_iniPath, INI_FILE_NAME, MAX_PATH);
+        return;
+    }
+    /* Bounded copy of the filename suffix instead of strcpy. */
+    remaining = MAX_PATH - (int)(lastSlash + 1 - g_iniPath);
+    if (remaining < 1) {
+        lstrcpyn(g_iniPath, INI_FILE_NAME, MAX_PATH);
+        return;
+    }
+    lstrcpyn(lastSlash + 1, INI_FILE_NAME, remaining);
 }
 
 static void LoadContacts(void) {
@@ -1061,25 +1159,28 @@ static void HandleEditSelected(void) {
 }
 
 static void HandleRemoveSelected(void) {
-    int    selCount = ListView_GetSelectedCount(g_hListView);
-    char** namesToDelete;
-    int    iPos = -1, idx = 0, i;
+    int   selCount = ListView_GetSelectedCount(g_hListView);
+    int   iPos = -1, idx = 0, i;
+    char (*names)[256];
 
     if (selCount <= 0) return;
 
-    namesToDelete = (char**)malloc(selCount * sizeof(char*));
-    if (namesToDelete == NULL) return;
+    /* Single allocation, single failure check; the old per-element
+     * malloc loop ignored allocation failures and could call
+     * RemoveContact() on a NULL pointer. */
+    names = (char(*)[256])malloc((size_t)selCount * sizeof(*names));
+    if (names == NULL) {
+        SetStatus("Remove failed: out of memory.", COLOR_BAD, STATUS_CLEAR_MS_SINGLE);
+        return;
+    }
 
-    while ((iPos = ListView_GetNextItem(g_hListView, iPos, LVNI_SELECTED)) != -1) {
-        namesToDelete[idx] = (char*)malloc(256);
-        ListView_GetItemText(g_hListView, iPos, COL_NAME, namesToDelete[idx], 256);
+    while (idx < selCount &&
+           (iPos = ListView_GetNextItem(g_hListView, iPos, LVNI_SELECTED)) != -1) {
+        ListView_GetItemText(g_hListView, iPos, COL_NAME, names[idx], (int)sizeof(names[idx]));
         idx++;
     }
-    for (i = 0; i < selCount; i++) {
-        RemoveContact(namesToDelete[i]);
-        free(namesToDelete[i]);
-    }
-    free(namesToDelete);
+    for (i = 0; i < idx; i++) RemoveContact(names[i]);
+    free(names);
 
     g_editingName[0] = '\0';
     SetWindowText(g_hBtnAdd, "Add");
@@ -1208,6 +1309,10 @@ static void CreateMainControls(void) {
     g_hEditMac     = CreateWindow("EDIT", "",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
         0, 0, 0, 0, g_hMain, (HMENU)ID_EDIT_MAC, NULL, NULL);
+    /* XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX is 17 chars; anything
+     * longer can't be a MAC and just lets the user paste garbage that
+     * silently truncates inside WakeEvaluateOne. */
+    Edit_LimitText(g_hEditMac, 17);
     g_hLblComment  = CreateWindow("STATIC", "Comment:",
         WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, g_hMain, NULL, NULL, NULL);
     g_hEditComment = CreateWindow("EDIT", "",
@@ -1351,7 +1456,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 ApplyCheckResult(result);
                 free(result);
             } else {
-                g_checkInProgress = 0;
+                InterlockedExchange(&g_checkInProgress, 0);
             }
             return 0;
         }
