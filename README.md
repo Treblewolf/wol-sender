@@ -32,7 +32,7 @@ The following flags are used to strip unnecessary bloat and optimize for the sma
 2.  **Compile**
     * To compile the source (assuming you have a `resources.o` for the application icon):
     ```bash
-    gcc wol_sender.c resources.o -o wolsender.exe -mwindows -Os -s -march=i386 -mno-sse -mno-sse2 -ffunction-sections -fdata-sections "-Wl,--gc-sections" -lwsock32 -lcomdlg32 -lcomctl32 -lshell32
+    gcc wol_sender.c resources.o -o wolsender.exe -mwindows -Os -s -march=i386 -mtune=i386 -mno-sse -mno-sse2 -ffunction-sections -fdata-sections "-Wl,--gc-sections" "-Wl,--disable-runtime-pseudo-reloc" -lwsock32 -lcomdlg32 -lcomctl32 -lshell32
     ```
 3.  **Compress (Optional)**
     * To further shrink the binary, use UPX with LZMA compression:
