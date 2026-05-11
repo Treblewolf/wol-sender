@@ -41,7 +41,7 @@ The following flags are used to strip unnecessary bloat and optimize for the sma
     ```
 
 ##  Requirements
-* **OS:** Windows (95 or newer)
+* **OS:** Windows 95 (IE 3.0/3.02 or newer)
 * **Network:** Wake-On-Lan (Magic Packets) must be enabled in the target computer's BIOS/UEFI and Network Adapter settings.
 
 ## License
